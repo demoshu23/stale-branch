@@ -1,0 +1,96 @@
+trigger: none
+
+schedules:
+- cron: "0 2 * * 0"
+  displayName: Weekly Stale Branch Cleanup
+  branches:
+    include:
+    - '*'
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+- group: StaleBranchCleanup # <-- linked variable group
+
+steps:
+# 1️⃣ Install Git
+- script: |
+    sudo apt-get update
+    sudo apt-get install -y git
+  displayName: Ensure Git Installed
+
+# 2️⃣ Configure Git
+- script: |
+    git config --global user.email "automation@yourdomain.com"
+    git config --global user.name "AzureDevOps CI"
+  displayName: Configure Git
+
+# 3️⃣ Loop over repositories & generate report
+- script: |
+    echo "Starting stale branch cleanup..."
+    REPORT_FILE="stale_branches_report.txt"
+    echo "Stale Branch Cleanup Report" > $REPORT_FILE
+    echo "Dry Run: $(DRY_RUN)" >> $REPORT_FILE
+    echo "Threshold: $(DAYS_THRESHOLD) days" >> $REPORT_FILE
+    echo "----------------------------------------" >> $REPORT_FILE
+
+    while IFS= read -r repo || [[ -n "$repo" ]]; do
+      [[ -z "$repo" || "$repo" =~ ^# ]] && continue
+
+      echo "Processing repository: $repo"
+      echo "" >> $REPORT_FILE
+      echo "Repository: $repo" >> $REPORT_FILE
+
+      git clone https://$(System.AccessToken)@dev.azure.com/$(AZURE_DEVOPS_ORG)/$(AZURE_PROJECT)/_git/$repo
+      cd $repo || exit
+      git fetch --prune
+
+      DELETED_BRANCHES=()
+
+      for branch in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/); do
+        branch_name=${branch#origin/}
+        if [[ $(echo "$(PROTECTED_BRANCHES)" | grep -w $branch_name) ]]; then
+          continue
+        fi
+
+        last_commit_ts=$(git log -1 --format=%ct origin/$branch_name)
+        threshold_ts=$(date -d "$(DAYS_THRESHOLD) days ago" +%s)
+
+        if [ $last_commit_ts -lt $threshold_ts ]; then
+          if [ "$(DRY_RUN)" = "true" ]; then
+            echo "[Dry Run] $branch_name would be deleted" >> "../$REPORT_FILE"
+          else
+            git push origin --delete $branch_name
+            echo "Deleted branch: $branch_name" >> "../$REPORT_FILE"
+          fi
+          DELETED_BRANCHES+=($branch_name)
+        fi
+      done
+
+      if [ ${#DELETED_BRANCHES[@]} -eq 0 ]; then
+        echo "No stale branches to delete in $repo." >> "../$REPORT_FILE"
+      fi
+
+      cd ..
+    done < "$(REPO_FILE)"
+
+    cat $REPORT_FILE
+  displayName: Cleanup Stale Branches & Generate Report
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+# 4️⃣ Send Email Notification
+- task: Email@1
+  displayName: Send Stale Branch Cleanup Report
+  inputs:
+    To: $(NOTIFY_EMAIL)
+    Subject: "Weekly Stale Branch Cleanup Report"
+    Body: |
+      Hello Team,
+
+      Please find the weekly stale branch cleanup report attached.
+
+      $(Build.ArtifactStagingDirectory)/stale_branches_report.txt
+    Attachments: |
+      $(Build.ArtifactStagingDirectory)/stale_branches_report.txt
